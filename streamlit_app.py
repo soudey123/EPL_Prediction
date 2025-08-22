@@ -1,45 +1,45 @@
-import os
+import os, io, requests
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pathlib import Path
-from src.ingest import get_historic_premier_data, load_manual_csv
+
+st.set_page_config(page_title="EPL Predictor 2025–26 (ML + GPT‑5 + Draw Tuning)", layout="wide")
+st.title("🏟️ EPL Predictor — 2025–26 (ML + GPT‑5 + Draw Tuning)")
+
+from src.ingest import get_historic_premier_data
 from src.features import build_features
-from src.model import train_models, predict_proba, TARGETS
+from src.model import train_models, predict_proba, LABEL2ID
 from src.predict import fetch_fixtures_api, prepare_prediction_rows
-from src.utils import brier_score
 
-st.set_page_config(page_title="EPL Predictor 2025–26", layout="wide")
+try:
+    from src.ics_tools import fixtures_from_ics_texts
+    ICS_AVAILABLE = True
+except Exception:
+    ICS_AVAILABLE = False
 
-st.title("🏟️ EPL Predictor — Season 2025–26")
-st.caption("End-to-end ML tool to forecast Premier League match results (H/D/A).")
+from src.stacking import train_stacked, stacked_predict
+from src.gpt5_scorer import gpt5_probs_from_card, feature_card
+from src.tuning import tune_draw_boost, solve_boost_for_target_mean_draw
 
-with st.expander("ℹ️ How it works"):
+with st.expander("ℹ️ What’s here"):
     st.markdown("""
-    **Pipeline**  
-    1) Ingest historical results (Football-Data) and optional First Division files you provide.  
-    2) Engineer features: rolling form, goals, head-to-head aggregates, Elo rating & win-prob proxy.  
-    3) Train two models (LogReg & XGBoost) with time-aware CV and probability calibration.  
-    4) Pull **2025–26 fixtures** via API-Football (or upload fixtures CSV) and generate predictions.  
-    5) Export predictions and view feature importance.
+    - **Prediction engine:** ML‑only, GPT‑5‑only, Blend, or Stacked meta‑model.  
+    - **Draw boost:** auto‑tune via log loss (last 15%) or solve for a target mean draw rate.  
     """)
 
 st.header("1) Historical Data")
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Fetch Football-Data (1993 → last season)")
-    if st.button("Download & Build Dataset"):
-        with st.spinner("Downloading Premier League CSVs (Football-Data)..."):
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("Download & Build Dataset (Football-Data)"):
+        with st.spinner("Downloading and building…"):
             try:
                 hist = get_historic_premier_data(start=1993)
                 st.session_state["historic"] = hist
-                st.success(f"Loaded {len(hist):,} matches from {hist['SeasonStart'].min()}–{hist['SeasonStart'].max()+1}")
+                st.success(f"Loaded {len(hist):,} matches.")
             except Exception as e:
                 st.error(f"Download failed: {e}")
-
-with col2:
-    st.subheader("Or upload your historic CSV")
-    up = st.file_uploader("CSV with at least: Date, HomeTeam, AwayTeam, FTHG, FTAG", type=["csv"])
+with c2:
+    up = st.file_uploader("Or upload historic CSV (Date, HomeTeam, AwayTeam, FTHG, FTAG)", type=["csv"])
     if up is not None:
         df = pd.read_csv(up)
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -50,48 +50,142 @@ if "historic" not in st.session_state:
     st.info("Load or upload historic data to proceed.")
     st.stop()
 
-st.header("2) Feature Engineering & Training")
-if st.button("Build features & train models"):
-    with st.spinner("Engineering features and training models..."):
+st.header("2) Features & Base Model")
+if st.button("Build features & train model"):
+    with st.spinner("Engineering features and training…"):
         feats = build_features(st.session_state["historic"])
         model, info = train_models(feats)
         st.session_state["features"] = feats
-        st.session_state["model"] = model
-        st.session_state["model_info"] = info
-        st.success("Models trained and calibrated.")
-        st.write("Cross-validated log loss:", info["cv_logloss"])
+        st.session_state["base_model"] = model
+        st.session_state["base_info"] = info
+        st.success("Base model trained.")
+        st.write("Base CV log loss:", info["cv_logloss"])
 
-if "model" not in st.session_state:
-    st.info("Train models to continue.")
+if "base_model" not in st.session_state:
+    st.info("Train base model to continue.")
     st.stop()
 
-st.header("3) Fixtures for 2025–26 & Predictions")
-mode = st.radio("How to get fixtures?", ["API-Football (recommended)", "Upload CSV"])
+st.header("3) Fixtures (2025–26)")
+choices = ["API-Football", "Upload CSV"]
+if ICS_AVAILABLE:
+    choices.append("ICS (URL or upload)")
+mode = st.radio("Choose source:", choices)
 
-if mode == "API-Football (recommended)":
-    if st.button("Fetch fixtures via API-Football"):
+if mode == "API-Football":
+    if st.button("Fetch via API-Football"):
         try:
             fx = fetch_fixtures_api(season=2025, league=39)
             st.session_state["fixtures"] = fx
-            st.success(f"Loaded {len(fx):,} fixtures for 2025–26.")
+            st.success(f"Loaded {len(fx):,} fixtures.")
         except Exception as e:
             st.error(str(e))
-else:
+elif mode == "Upload CSV":
     up2 = st.file_uploader("Upload fixtures CSV (Date, HomeTeam, AwayTeam)", type=["csv"], key="fx")
     if up2 is not None:
         fx = pd.read_csv(up2)
         fx["Date"] = pd.to_datetime(fx["Date"], errors="coerce")
         st.session_state["fixtures"] = fx
         st.success(f"Uploaded {len(fx):,} fixtures.")
+else:
+    st.write("Paste ICS URLs (one per line) and/or upload .ics files, then click Build.")
+    urls_text = st.text_area("ICS URLs", height=110)
+    ics_files = st.file_uploader("Upload .ics files", type=["ics"], accept_multiple_files=True, key="ics")
+    if st.button("Build fixtures from ICS"):
+        texts = []
+        for u in (urls_text or "").splitlines():
+            u = u.strip()
+            if not u: continue
+            try:
+                r = requests.get(u, timeout=30); r.raise_for_status()
+                texts.append((r.text, u))
+            except Exception as e:
+                st.warning(f"Failed to fetch {u}: {e}")
+        for f in ics_files or []:
+            try:
+                texts.append((f.getvalue().decode("utf-8", errors="ignore"), f.name))
+            except Exception as e:
+                st.warning(f"Read failed for {getattr(f,'name','(file)')}: {e}")
+        if not texts:
+            st.error("No ICS input provided.")
+        else:
+            from src.ics_tools import fixtures_from_ics_texts as parse_ics
+            try:
+                df_fx = parse_ics(texts)
+                if df_fx.empty: st.error("Parsed 0 fixtures from ICS.")
+                else:
+                    df_fx["Date"] = pd.to_datetime(df_fx["Date"], errors="coerce")
+                    st.session_state["fixtures"] = df_fx
+                    st.success(f"Built {len(df_fx):,} fixtures from ICS.")
+                    st.dataframe(df_fx.head(20))
+                    st.download_button("⬇️ Download fixtures CSV", data=df_fx.to_csv(index=False), file_name="fixtures_2025_26.csv")
+            except Exception as e:
+                st.error(f"ICS parse error: {e}")
 
 if "fixtures" not in st.session_state:
-    st.info("Load fixtures to make predictions.")
+    st.info("Load fixtures to continue.")
     st.stop()
 
+st.header("4) Prediction Engine")
+engine = st.radio("Engine:", ["ML only", "GPT‑5 only", "Blend (α·ML + (1−α)·GPT‑5)", "Stacked (meta‑model)"])
+if engine == "Blend (α·ML + (1−α)·GPT‑5)":
+    alpha = st.slider("Blending weight α (ML share)", 0.0, 1.0, 0.75, 0.05)
+if engine == "Stacked (meta‑model)":
+    seasons_back = st.slider("Seasons back (stacking window)", 3, 8, 5, 1)
+    if st.button("Train stacked meta‑model"):
+        with st.spinner("Training stacked meta‑model…"):
+            try:
+                meta_model, meta_info = train_stacked(st.session_state["base_model"], st.session_state["features"], seasons_back=seasons_back)
+                st.session_state["meta_model"] = meta_model
+                st.success(f"Stacked meta-model trained. CV log loss: {meta_info['cv_logloss_meta']:.3f} on {meta_info['samples']} samples")
+            except Exception as e:
+                st.error(f"Stacking failed: {e}")
+
+st.header("5) Draw Boost")
+colL, colR = st.columns(2)
+with colL:
+    if st.button("Auto‑tune (log loss, last 15%)"):
+        b_star, ll, table = tune_draw_boost(st.session_state["base_model"], st.session_state["features"], frac=0.15)
+        st.session_state["draw_boost_b"] = b_star
+        st.success(f"Recommended b = {b_star:.2f}  (val log loss {ll:.3f})")
+        st.dataframe(table.head(10))
+with colR:
+    target = st.number_input("Target mean draw rate", min_value=0.10, max_value=0.40, value=0.25, step=0.01)
+manual_b = st.slider("Manual Draw Boost × (fallback if no auto‑tune/target)", 0.5, 1.6, 1.25, 0.05)
+
+st.header("6) Predict Season")
 if st.button("Predict all fixtures"):
-    with st.spinner("Preparing rows & predicting..."):
+    with st.spinner("Preparing rows & predicting…"):
         hist_feats, future_rows = prepare_prediction_rows(st.session_state["historic"], st.session_state["fixtures"])
-        probs = predict_proba(st.session_state["model"], future_rows)
+
+        if engine == "ML only":
+            probs = predict_proba(st.session_state["base_model"], future_rows)
+        elif engine == "GPT‑5 only":
+            P_gpt = np.zeros((len(future_rows),3))
+            for i, (_, row) in enumerate(future_rows.iterrows()):
+                P_gpt[i,:] = gpt5_probs_from_card(feature_card(row))
+            probs = P_gpt
+        elif engine == "Blend (α·ML + (1−α)·GPT‑5)":
+            P_ml = predict_proba(st.session_state["base_model"], future_rows)
+            P_gpt = np.zeros_like(P_ml)
+            for i, (_, row) in enumerate(future_rows.iterrows()):
+                P_gpt[i,:] = gpt5_probs_from_card(feature_card(row))
+            probs = alpha * P_ml + (1.0 - alpha) * P_gpt
+        else:
+            if "meta_model" not in st.session_state:
+                st.error("Train the stacked meta‑model first.")
+                st.stop()
+            probs = stacked_predict(st.session_state["base_model"], st.session_state["meta_model"], future_rows)
+
+        # Draw boost
+        b = st.session_state.get("draw_boost_b", None)
+        if b is None and target:
+            b, achieved = solve_boost_for_target_mean_draw(probs, target=target)
+            st.info(f"Solved b = {b:.2f} for target mean draw {target:.2f}")
+        elif b is None:
+            b = manual_b
+        probs[:,1] *= b
+        probs = probs / probs.sum(axis=1, keepdims=True)
+
         pred_df = future_rows[["Date","HomeTeam","AwayTeam"]].copy()
         pred_df["p_H"] = probs[:,0]
         pred_df["p_D"] = probs[:,1]
@@ -101,37 +195,8 @@ if st.button("Predict all fixtures"):
         st.success("Predictions ready.")
 
 if "predictions" in st.session_state:
-    st.subheader("Predicted probabilities — 2025–26")
+    st.subheader("Season predictions")
+    P = st.session_state["predictions"][["p_H","p_D","p_A"]].values
+    st.write(f"Mean probs — H: {P[:,0].mean():.3f}, D: {P[:,1].mean():.3f}, A: {P[:,2].mean():.3f}")
     st.dataframe(st.session_state["predictions"].sort_values("Date").reset_index(drop=True))
-    st.download_button("⬇️ Download CSV", data=st.session_state["predictions"].to_csv(index=False), file_name="epl_2025_26_predictions.csv")
-
-st.header("4) Model Explainability & Evaluation")
-if "features" in st.session_state:
-    feats = st.session_state["features"]
-    if "label" in feats.columns:
-        # quick backtest score on last season segment
-        cutoff = feats["Date"].quantile(0.85)
-        test = feats[feats["Date"]>cutoff]
-        if len(test) > 50:
-            probs = predict_proba(st.session_state["model"], test)
-            y = test["label"].values
-            from sklearn.metrics import log_loss, accuracy_score
-            ll = log_loss(y, probs, labels=["H","D","A"])
-            brier = float(np.mean(np.sum((np.eye(3)[pd.Series(y).map({'H':0,'D':1,'A':2}).values] - probs)**2, axis=1)))
-            st.write(f"Backtest Log Loss: **{ll:.3f}**")
-            st.write(f"Brier Score: **{brier:.3f}**")
-
-    # Feature importances (XGBoost if selected as best; otherwise coefficients proxy)
-    info = st.session_state.get("model_info", {})
-    feat_names = info.get("features", [])
-    st.write("Top feature signals (proxy):")
-    try:
-        # Try to access underlying estimator if XGB
-        est = st.session_state["model"].base_estimator.named_steps.get("clf", None)
-        if est and hasattr(est, "feature_importances_"):
-            fi = pd.Series(est.feature_importances_, index=feat_names).sort_values(ascending=False).head(20)
-            st.bar_chart(fi)
-        else:
-            st.info("Feature importances not available (Logistic selected).")
-    except Exception:
-        st.info("Feature importance unavailable.")
+    st.download_button("⬇️ Download CSV", data=st.session_state["predictions"].to_csv(index=False), file_name="epl_2025_26_predictions_calibrated.csv")

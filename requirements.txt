@@ -10,3 +10,5 @@ tqdm==4.66.5
 matplotlib==3.9.0
 plotly==5.23.0
 pyyaml==6.0.2
+ics==0.7.2
+openai>=1.40.0
